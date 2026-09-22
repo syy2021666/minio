@@ -1,0 +1,179 @@
+name: Build & Release MinIO Multi-Platform
+
+on:
+  workflow_dispatch:
+    inputs:
+      minio_version:
+        description: 'MinIO 版本 tag（如 RELEASE.2025-10-15T17-29-55Z）'
+        required: true
+        default: 'RELEASE.2025-10-15T17-29-55Z'
+        type: string
+      release_tag:
+        description: 'Release 标签名（如 v2025.10.15）'
+        required: true
+        default: 'v2025.10.15'
+        type: string
+      is_prerelease:
+        description: '是否标记为预发布版本'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  GOPROXY: https://goproxy.cn,direct
+  CGO_ENABLED: 0
+
+jobs:
+  # ============ 第一阶段：多平台编译 ============
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            suffix: linux-amd64
+          - goos: linux
+            goarch: arm64
+            suffix: linux-arm64
+          - goos: linux
+            goarch: arm
+            goarm: 7
+            suffix: linux-armv7
+          - goos: linux
+            goarch: mips64
+            suffix: linux-mips64
+          - goos: linux
+            goarch: mips64le
+            suffix: linux-mips64le
+          - goos: linux
+            goarch: s390x
+            suffix: linux-s390x
+          - goos: linux
+            goarch: ppc64le
+            suffix: linux-ppc64le
+          - goos: darwin
+            goarch: amd64
+            suffix: darwin-amd64
+          - goos: darwin
+            goarch: arm64
+            suffix: darwin-arm64
+          - goos: windows
+            goarch: amd64
+            suffix: windows-amd64.exe
+          - goos: linux
+            goarch: riscv64
+            suffix: linux-riscv64
+          - goos: linux
+            goarch: loong64
+            suffix: linux-loong64
+
+    steps:
+      - name: Checkout MinIO source
+        uses: actions/checkout@v4
+        with:
+          repository: minio/minio
+          ref: ${{ inputs.minio_version }}
+          path: minio-src
+          fetch-depth: 1
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: minio-src/go.mod
+          cache-dependency-path: minio-src/go.sum
+
+      - name: Build static binary
+        working-directory: minio-src
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+        run: |
+          VERSION=${{ inputs.minio_version }}
+          COMMIT=$(git rev-parse --short HEAD)
+          BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          echo "Building minio for $GOOS/$GOARCH (version: $VERSION)..."
+
+          go build -trimpath \
+            -ldflags="-s -w \
+              -X github.com/minio/minio/cmd.Version=$VERSION \
+              -X github.com/minio/minio/cmd.CommitID=$COMMIT \
+              -X github.com/minio/minio/cmd.ReleaseTag=$VERSION \
+              -X github.com/minio/minio/cmd.BuildTime=$BUILD_DATE" \
+            -o minio-${{ matrix.suffix }} \
+            ./cmd/minio
+
+          # 压缩产物以加速上传/下载
+          if [ "$GOOS" = "windows" ]; then
+            zip minio-${{ matrix.suffix }}.zip minio-${{ matrix.suffix }}
+          else
+            tar czf minio-${{ matrix.suffix }}.tar.gz minio-${{ matrix.suffix }}
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: minio-${{ matrix.suffix }}
+          path: minio-src/minio-${{ matrix.suffix }}.*
+          retention-days: 5
+
+  # ============ 第二阶段：收集产物并发布 Release ============
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # 必须：创建 Release 和上传附件
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+
+      - name: Flatten artifact directories
+        run: |
+          # 将每个子目录中的文件移动到顶层，方便 action-gh-release 上传
+          find release-assets -mindepth 2 -type f -exec mv {} release-assets/ \;
+          find release-assets -mindepth 1 -type d -empty -delete
+          echo "Files to release:"
+          ls -lh release-assets/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          name: MinIO ${{ inputs.release_tag }} (${{ inputs.minio_version }})
+          body: |
+            ## MinIO 多平台静态编译产物
+
+            - **MinIO 源码版本**: `${{ inputs.minio_version }}`
+            - **编译时间**: ${{ github.event.inputs.release_tag }}
+            - **Go 版本**: 由 `go.mod` 自动匹配
+            - **编译参数**: `CGO_ENABLED=0`（纯静态链接）
+
+            ### 包含平台
+            - Linux: amd64, arm64, armv7, mips64, mips64le, s390x, ppc64le, riscv64, loong64
+            - macOS: amd64, arm64
+            - Windows: amd64
+
+            ### 使用说明
+            ```bash
+            # Linux 示例
+            tar xzf minio-linux-amd64.tar.gz
+            chmod +x minio-linux-amd64
+            ./minio-linux-amd64 --version
+
+            # 启动单节点
+            ./minio-linux-amd64 server /data
+
+            ```
+          files: |
+            release-assets/*
+          draft: false
+          prerelease: ${{ inputs.is_prerelease }}
+          generate_release_notes: false   # 非本项目代码，不自动生成 notes
+          fail_on_unmatched_files: true   # 有文件缺失时让 workflow 失败
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
